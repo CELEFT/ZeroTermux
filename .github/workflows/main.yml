@@ -1,0 +1,206 @@
+name: Attach Debug APKs To Release (API 32 + JDK 21 + NDK r29)
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  attach-apks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package_variant: [ apt-android-7, apt-android-5 ]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # ==================== 1. 检出代码 ====================
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.GITHUB_REF }}
+
+      # ==================== 2. JDK 21 ====================
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # ==================== 3. Android SDK + API 32 ====================
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platforms for API 32
+        run: |
+          sdkmanager \
+            "platforms;android-32" \
+            "build-tools;33.0.2" \
+            --sdk_root=$ANDROID_SDK_ROOT
+
+      # ==================== 4. NDK r29 ====================
+      - name: Download and install NDK r29
+        run: |
+          NDK_ZIP="android-ndk-r29-linux.zip"
+          NDK_URL="https://googledownloads.cn/android/repository/${NDK_ZIP}"
+          NDK_DIR="${{ runner.temp }}/ndk-r29"
+
+          echo "Downloading NDK r29 from $NDK_URL"
+          curl -fsSL -o "${{ runner.temp }}/${NDK_ZIP}" "$NDK_URL"
+
+          echo "Extracting NDK r29"
+          unzip -q "${{ runner.temp }}/${NDK_ZIP}" -d "${{ runner.temp }}"
+          mv "${{ runner.temp }}/android-ndk-r29" "$NDK_DIR"
+
+          # 从 source.properties 读取 NDK 版本号
+          NDK_REVISION=$(grep "Pkg.Revision" "$NDK_DIR/source.properties" | cut -d'=' -f2 | tr -d ' ')
+          echo "Detected NDK version: $NDK_REVISION"
+
+          # 写入环境变量
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "JITPACK_NDK_VERSION=$NDK_REVISION" >> "$GITHUB_ENV"
+
+          # 写入 local.properties
+          echo "ndk.dir=$NDK_DIR" >> local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
+
+          # 清理
+          rm -f "${{ runner.temp }}/${NDK_ZIP}"
+
+      # ==================== 5. 降级 Gradle wrapper（兼容 AGP 8.13.2） ====================
+      - name: Downgrade Gradle wrapper to 8.13.x (compatible with AGP 8.13.2)
+        run: |
+          # AGP 8.13.x 需要 Gradle 8.13+，不支持 Gradle 9.x
+          # 使用 gradle wrapper 命令降级
+          chmod +x gradlew
+          ./gradlew wrapper --gradle-version=8.13.2 --distribution-type=bin
+          echo "===== Gradle wrapper updated to: ====="
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      # ==================== 6. 覆写 gradle.properties → API 32 ====================
+      - name: Override gradle.properties for API 32
+        run: |
+          # 备份原文件
+          cp gradle.properties gradle.properties.bak
+
+          cat > gradle.properties << 'PROPERTIES'
+          # ===== API 32 配置 =====
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m
+          org.gradle.parallel=true
+
+          compileSdkVersion=32
+          targetSdkVersion=32
+          minSdkVersion=24
+
+          android.useAndroidX=true
+          PROPERTIES
+
+          echo "===== gradle.properties 已设置为 API 32 ====="
+          cat gradle.properties
+
+      # ==================== 7. 签名文件（如需要） ====================
+      - name: Decode signing keystore
+        env:
+          PHONE_JKS_BASE64: ${{ secrets.PHONE_JKS_BASE64 }}
+        if: env.PHONE_JKS_BASE64 != ''
+        run: |
+          echo "$PHONE_JKS_BASE64" | base64 -d > phone.jks
+          echo "phone.jks 已从 secret 恢复"
+
+      - name: Check if phone.jks exists
+        run: |
+          if [ -f phone.jks ]; then
+            echo "phone.jks exists, will use for signing"
+          else
+            echo "WARNING: phone.jks not found. Signing will use default config."
+            echo "If build fails, create phone.jks or check secrets."
+          fi
+
+      # ==================== 8. 构建并附加 APK ====================
+      - name: Build and attach APKs to release
+        shell: bash {0}
+        env:
+          PACKAGE_VARIANT: ${{ matrix.package_variant }}
+        run: |
+          exit_on_error() {
+              echo "$1"
+              echo "Deleting '$RELEASE_VERSION_NAME' release and '$GITHUB_REF' tag"
+              hub release delete "$RELEASE_VERSION_NAME"
+              git push --delete origin "$GITHUB_REF"
+              exit 1
+          }
+
+          echo "===== 环境验证 ====="
+          echo "Java:"
+          java -version
+          echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+          echo "JITPACK_NDK_VERSION: $JITPACK_NDK_VERSION"
+          echo "SDK 版本:"
+          grep -E "compileSdk|targetSdk|minSdk" gradle.properties
+
+          echo "===== 设置变量 ====="
+          RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
+          if ! printf "%s" "${RELEASE_VERSION_NAME/v/}" | grep -qP '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'; then
+           exit_on_error "The versionName '${RELEASE_VERSION_NAME/v/}' is not a valid version as per semantic version '2.0.0' spec."
+          fi
+
+          APK_DIR_PATH="./app/build/outputs/apk/debug"
+          APK_VERSION_TAG="$RELEASE_VERSION_NAME+${{ env.PACKAGE_VARIANT }}-github-debug"
+          APK_BASENAME_PREFIX="termux-app_$APK_VERSION_TAG"
+
+          echo "===== 开始构建 ====="
+          export TERMUX_APK_VERSION_TAG="$APK_VERSION_TAG"
+          export TERMUX_PACKAGE_VARIANT="${{ env.PACKAGE_VARIANT }}"
+
+          # 清理上次构建产物（避免混淆）
+          rm -rf app/build/outputs
+
+          if ! ./gradlew assembleDebug; then
+            exit_on_error "Build failed for '$APK_VERSION_TAG' release."
+          fi
+
+          echo "===== 验证 APK 文件 ====="
+          for abi in universal arm64-v8a armeabi-v7a x86_64 x86; do
+            if ! test -f "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_$abi.apk"; then
+              files_found="$(ls "$APK_DIR_PATH")"
+              exit_on_error "Failed to find built APK at '$APK_DIR_PATH/${APK_BASENAME_PREFIX}_$abi.apk'. Files found: "$'\n'"$files_found"
+            fi
+          done
+
+          echo "===== 生成 SHA256 校验文件 ====="
+          if ! (cd "$APK_DIR_PATH"; sha256sum \
+            "${APK_BASENAME_PREFIX}_universal.apk" \
+            "${APK_BASENAME_PREFIX}_arm64-v8a.apk" \
+            "${APK_BASENAME_PREFIX}_armeabi-v7a.apk" \
+            "${APK_BASENAME_PREFIX}_x86_64.apk" \
+            "${APK_BASENAME_PREFIX}_x86.apk" \
+            > "${APK_BASENAME_PREFIX}_sha256sums"); then
+            exit_on_error "Generate sha256sums failed for '$APK_VERSION_TAG' release."
+          fi
+
+          echo "===== 附加 APK 到 GitHub Release ====="
+          if ! hub release edit \
+          -m "" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_universal.apk" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_arm64-v8a.apk" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_armeabi-v7a.apk" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_x86_64.apk" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_x86.apk" \
+          -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_sha256sums" \
+          "$RELEASE_VERSION_NAME"; then
+            exit_on_error "Attach APKs to release failed for '$APK_VERSION_TAG' release."
+          fi
+
+          echo "===== 构建成功！======"
+
+      # ==================== 9. 恢复 gradle.properties（总是执行） ====================
+      - name: Restore gradle.properties
+        if: always()
+        run: |
+          if [ -f gradle.properties.bak ]; then
+            mv gradle.properties.bak gradle.properties
+            echo "gradle.properties 已恢复"
+          fi
