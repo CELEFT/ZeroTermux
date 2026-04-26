@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag name (e.g. v0.118.3)'
-        required: true
-        default: 'v0.118.55'
+        description: 'Release tag name (for release upload) or leave empty for default branch'
+        required: false
+        default: ''
   release:
     types:
       - published
@@ -24,10 +24,13 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
+      # ===== 修复：手动触发时检出默认分支，Release 触发时检出 tag =====
       - name: Clone repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || env.GITHUB_REF }}
+          # 手动触发: 不指定 ref → 自动检默认分支
+          # Release 触发: 用 GITHUB_REF（就是 tag ref）
+          ref: ${{ github.event_name == 'release' && env.GITHUB_REF || '' }}
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -60,8 +63,6 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
           rm -f "${{ runner.temp }}/${NDK_ZIP}"
 
-      # ❌ 删掉了 Gradle 降级步骤 — 直接用 Gradle 9.2.1 + AGP 8.13.2
-
       - name: Set gradle.properties to API 32
         run: |
           cp gradle.properties gradle.properties.bak
@@ -81,21 +82,28 @@ jobs:
         run: |
           exit_on_error() {
               echo "$1"
-              RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
-              if [ -n "$RELEASE_VERSION_NAME" ] && [ "$RELEASE_VERSION_NAME" != "$GITHUB_REF" ]; then
+              if [ "${{ github.event_name }}" = "release" ]; then
+                RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
                 hub release delete "$RELEASE_VERSION_NAME" 2>/dev/null || true
                 git push --delete origin "$GITHUB_REF" 2>/dev/null || true
               fi
               exit 1
           }
 
+          # 手动触发时使用输入的 tag（仅用于版本命名，不用于 checkout）
+          # Release 触发时从 GITHUB_REF 提取
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RELEASE_VERSION_NAME="${{ github.event.inputs.tag }}"
+            INPUT_TAG="${{ github.event.inputs.tag }}"
+            if [ -n "$INPUT_TAG" ]; then
+              RELEASE_VERSION_NAME="$INPUT_TAG"
+            else
+              RELEASE_VERSION_NAME="manual-build-$(date +%Y%m%d%H%M%S)"
+            fi
           else
             RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
           fi
 
-          echo "Building for version: $RELEASE_VERSION_NAME"
+          echo "Building version name: $RELEASE_VERSION_NAME"
 
           APK_DIR_PATH="./app/build/outputs/apk/debug"
           APK_VERSION_TAG="$RELEASE_VERSION_NAME+${{ env.PACKAGE_VARIANT }}-github-debug"
@@ -104,11 +112,12 @@ jobs:
           export TERMUX_APK_VERSION_TAG="$APK_VERSION_TAG"
           export TERMUX_PACKAGE_VARIANT="${{ env.PACKAGE_VARIANT }}"
 
-          echo "===== 环境验证 ====="
+          echo "===== 环境 ====="
           echo "Java: $(java -version 2>&1 | head -1)"
-          echo "Gradle: $(./gradlew --version 2>&1 | grep Gradle | head -1)"
+          echo "Gradle: $(./gradlew --version 2>&1 | grep 'Gradle ' | head -1)"
           echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
-          echo "SDK: $(grep compileSdk gradle.properties)"
+          echo "compileSdk: $(grep compileSdk gradle.properties)"
+          echo "Git ref: $(git rev-parse --short HEAD)"
 
           if ! ./gradlew assembleDebug; then
             exit_on_error "Build failed"
@@ -144,9 +153,25 @@ jobs:
               -a "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_sha256sums" \
               "$RELEASE_VERSION_NAME"
           else
-            echo "===== APK 构建完成（手动触发） ====="
+            echo "===== 手动触发：APK 已构建 ====="
+            echo "APK 版本标记: $APK_VERSION_TAG"
             ls -lh "$APK_DIR_PATH"
+            echo ""
+            echo "如需下载 APK，请使用 GitHub Artifacts 或 gh CLI"
+            echo "APK 位于: $APK_DIR_PATH"
           fi
+
+      - name: Upload APKs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-api32-apks-${{ matrix.package_variant }}
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Upload SHA256 as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-api32-sha256-${{ matrix.package_variant }}
+          path: app/build/outputs/apk/debug/*sha256sums
 
       - name: Restore gradle.properties
         if: always()
