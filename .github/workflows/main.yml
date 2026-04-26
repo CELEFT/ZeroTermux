@@ -24,12 +24,9 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      # ===== 修复：手动触发时检出默认分支，Release 触发时检出 tag =====
       - name: Clone repository
         uses: actions/checkout@v6
         with:
-          # 手动触发: 不指定 ref → 自动检默认分支
-          # Release 触发: 用 GITHUB_REF（就是 tag ref）
           ref: ${{ github.event_name == 'release' && env.GITHUB_REF || '' }}
 
       - name: Set up JDK 21
@@ -63,17 +60,27 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
           rm -f "${{ runner.temp }}/${NDK_ZIP}"
 
-      - name: Set gradle.properties to API 32
+      # =====  修复：只修改 gradle.properties 中的 SDK 版本，保留其他内容  =====
+      - name: Override SDK versions in gradle.properties (preserve other properties)
         run: |
           cp gradle.properties gradle.properties.bak
-          cat > gradle.properties << 'EOF'
-          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m
-          org.gradle.parallel=true
-          compileSdkVersion=32
-          targetSdkVersion=32
-          minSdkVersion=24
-          android.useAndroidX=true
-          EOF
+
+          # 使用 sed 原地替换 SDK 版本号，而非覆盖整个文件
+          # 如果属性已存在则替换值，不存在则追加
+          for prop in "compileSdkVersion=32" "targetSdkVersion=32"; do
+            key="${prop%%=*}"
+            value="${prop#*=}"
+            if grep -q "^${key}=" gradle.properties; then
+              sed -i "s/^${key}=.*/${key}=${value}/" gradle.properties
+              echo "✅ 更新: ${key}=${value}"
+            else
+              echo "${key}=${value}" >> gradle.properties
+              echo "➕ 追加: ${key}=${value}"
+            fi
+          done
+
+          echo "===== 修改后的 gradle.properties（仅 SDK 相关）====="
+          grep -E "compileSdk|targetSdk|minSdk|markwon" gradle.properties
 
       - name: Build and attach APKs
         shell: bash {0}
@@ -90,8 +97,6 @@ jobs:
               exit 1
           }
 
-          # 手动触发时使用输入的 tag（仅用于版本命名，不用于 checkout）
-          # Release 触发时从 GITHUB_REF 提取
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             INPUT_TAG="${{ github.event.inputs.tag }}"
             if [ -n "$INPUT_TAG" ]; then
@@ -116,7 +121,7 @@ jobs:
           echo "Java: $(java -version 2>&1 | head -1)"
           echo "Gradle: $(./gradlew --version 2>&1 | grep 'Gradle ' | head -1)"
           echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
-          echo "compileSdk: $(grep compileSdk gradle.properties)"
+          grep -E "compileSdk|targetSdk|markwon" gradle.properties
           echo "Git ref: $(git rev-parse --short HEAD)"
 
           if ! ./gradlew assembleDebug; then
@@ -156,9 +161,6 @@ jobs:
             echo "===== 手动触发：APK 已构建 ====="
             echo "APK 版本标记: $APK_VERSION_TAG"
             ls -lh "$APK_DIR_PATH"
-            echo ""
-            echo "如需下载 APK，请使用 GitHub Artifacts 或 gh CLI"
-            echo "APK 位于: $APK_DIR_PATH"
           fi
 
       - name: Upload APKs as artifacts
