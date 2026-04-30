@@ -1,0 +1,220 @@
+name: Build API32 Release APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name or leave empty for default branch'
+        required: false
+        default: ''
+  release:
+    types:
+      - published
+
+jobs:
+  attach-apks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package_variant:
+          - apt-android-7
+          - apt-android-5
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && env.GITHUB_REF || '' }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platforms
+        run: |
+          sdkmanager \
+            "platforms;android-32" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            --sdk_root=$ANDROID_SDK_ROOT
+
+      - name: Download NDK r29
+        run: |
+          NDK_ZIP="android-ndk-r29-linux.zip"
+          NDK_URL="https://googledownloads.cn/android/repository/${NDK_ZIP}"
+          NDK_DIR="${{ runner.temp }}/ndk-r29"
+          curl -fsSL -o "${{ runner.temp }}/${NDK_ZIP}" "$NDK_URL"
+          unzip -q "${{ runner.temp }}/${NDK_ZIP}" -d "${{ runner.temp }}"
+          mv "${{ runner.temp }}/android-ndk-r29" "$NDK_DIR"
+          NDK_REVISION=$(grep "Pkg.Revision" "$NDK_DIR/source.properties" | cut -d'=' -f2 | tr -d ' ')
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "JITPACK_NDK_VERSION=$NDK_REVISION" >> "$GITHUB_ENV"
+          echo "ndk.dir=$NDK_DIR" >> local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
+          rm -f "${{ runner.temp }}/${NDK_ZIP}"
+
+      # ===== 签名文件 =====
+      - name: Decode signing keystore
+        env:
+          PHONE_JKS_BASE64: ${{ secrets.PHONE_JKS_BASE64 }}
+        if: env.PHONE_JKS_BASE64 != ''
+        run: |
+          echo "$PHONE_JKS_BASE64" | base64 -d > phone.jks
+          echo "phone.jks 已从 secret 恢复"
+
+      - name: Create dummy keystore if missing
+        run: |
+          if [ ! -f phone.jks ]; then
+            echo "⚠️ phone.jks 不存在，创建临时调试签名"
+            keytool -genkey -v -keystore phone.jks \
+              -alias phone1 -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass 123456 -keypass 654321 \
+              -dname "CN=Termux, OU=Dev, O=ZeroTermux, L=Unknown, ST=Unknown, C=CN"
+            echo "临时 phone.jks 已创建"
+          fi
+
+      - name: Override SDK versions in gradle.properties
+        run: |
+          cp gradle.properties gradle.properties.bak
+          for prop in "compileSdkVersion=35" "targetSdkVersion=32"; do
+            key="${prop%%=*}"
+            value="${prop#*=}"
+            if grep -q "^${key}=" gradle.properties; then
+              sed -i "s/^${key}=.*/${key}=${value}/" gradle.properties
+            else
+              echo "${key}=${value}" >> gradle.properties
+            fi
+          done
+          echo "===== SDK 版本 ====="
+          grep -E "compileSdk|targetSdk" gradle.properties
+
+      - name: Build release APKs
+        shell: bash {0}
+        env:
+          PACKAGE_VARIANT: ${{ matrix.package_variant }}
+          TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS: '1'
+          KEY_ALIAS: 'phone1'
+          KEY_PASSWORD: '654321'
+          STORE_PASSWORD: '123456'
+          # 让 APK 版本名简化，方便后续重命名
+          TERMUX_APK_VERSION_TAG: 'release'
+        run: |
+          exit_on_error() {
+              echo "❌ $1"
+              if [ "${{ github.event_name }}" = "release" ]; then
+                RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
+                hub release delete "$RELEASE_VERSION_NAME" 2>/dev/null || true
+                git push --delete origin "$GITHUB_REF" 2>/dev/null || true
+              fi
+              exit 1
+          }
+
+          # 版本名（用于日志和 release 上传）
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT_TAG="${{ github.event.inputs.tag }}"
+            if [ -n "$INPUT_TAG" ]; then
+              RELEASE_VERSION_NAME="$INPUT_TAG"
+            else
+              RELEASE_VERSION_NAME="manual-build-$(date +%Y%m%d%H%M%S)"
+            fi
+          else
+            RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
+          fi
+
+          echo "Building RELEASE: $RELEASE_VERSION_NAME"
+
+          export TERMUX_PACKAGE_VARIANT="${{ env.PACKAGE_VARIANT }}"
+
+          echo "===== 环境 ====="
+          echo "Java: $(java -version 2>&1 | head -1)"
+          echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
+          grep -E "compileSdk|targetSdk" gradle.properties
+          echo "APK 版本标记: release"
+
+          if ! ./gradlew assembleRelease; then
+            exit_on_error "Release build failed"
+          fi
+
+          echo "===== 构建完成，重命名 APK 文件 ====="
+
+          ORIG_DIR="$PWD"
+          APK_DIR_PATH="${ORIG_DIR}/app/build/outputs/apk/release"
+
+          if [ ! -d "$APK_DIR_PATH" ]; then
+            FOUND_DIRS=$(find "${ORIG_DIR}/app/build" -type d -name "release" 2>/dev/null | head -5)
+            exit_on_error "APK directory not found at '$APK_DIR_PATH'. Found: $FOUND_DIRS"
+          fi
+
+          cd "$APK_DIR_PATH"
+          echo "原始文件列表:"
+          ls -la
+
+          # ===== 重命名逻辑 =====
+          # 原文件名: termux-app_release_{abi}.apk
+          # 新文件名: termux-release-{abi}.apk
+          for old_file in *.apk; do
+            # 提取 abi 部分（最后一个 _ 之后）
+            abi="${old_file##*_}"
+            abi="${abi%.apk}"
+            new_file="termux-release-${abi}.apk"
+            mv -v "$old_file" "$new_file"
+          done
+
+          echo "===== 重命名后文件列表 ====="
+          ls -lh *.apk
+
+          # 生成 SHA256
+          sha256sum *.apk > termux-release-sha256sums.txt
+          echo "SHA256:"
+          cat termux-release-sha256sums.txt
+
+          cd "$ORIG_DIR"
+
+      - name: Upload Release APKs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-api32-release-apks-${{ matrix.package_variant }}
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Upload SHA256 as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-api32-release-sha256-${{ matrix.package_variant }}
+          path: app/build/outputs/apk/release/*sha256sums*
+
+      - name: Attach APKs to release (if triggered by release)
+        if: github.event_name == 'release'
+        shell: bash {0}
+        run: |
+          RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
+          APK_DIR_PATH="${GITHUB_WORKSPACE}/app/build/outputs/apk/release"
+
+          echo "===== 附加到 Release $RELEASE_VERSION_NAME ====="
+
+          hub release edit \
+            -m "" \
+            -a "$APK_DIR_PATH/termux-release-universal.apk" \
+            -a "$APK_DIR_PATH/termux-release-arm64-v8a.apk" \
+            -a "$APK_DIR_PATH/termux-release-armeabi-v7a.apk" \
+            -a "$APK_DIR_PATH/termux-release-x86_64.apk" \
+            -a "$APK_DIR_PATH/termux-release-x86.apk" \
+            -a "$APK_DIR_PATH/termux-release-sha256sums.txt" \
+            "$RELEASE_VERSION_NAME"
+
+          echo "✅ APK 已附加到 Release"
+
+      - name: Restore gradle.properties
+        if: always()
+        run: |
+          if [ -f gradle.properties.bak ]; then
+            mv gradle.properties.bak gradle.properties
+          fi
