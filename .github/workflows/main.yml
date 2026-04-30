@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag name (for release upload) or leave empty for default branch'
+        description: 'Release tag name or leave empty for default branch'
         required: false
         default: ''
   release:
@@ -38,11 +38,14 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK platform 32
+      # ===== 安装多个平台以满足依赖要求 =====
+      - name: Install Android SDK platforms
         run: |
           sdkmanager \
             "platforms;android-32" \
-            "build-tools;33.0.2" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
             --sdk_root=$ANDROID_SDK_ROOT
 
       - name: Download NDK r29
@@ -60,14 +63,13 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
           rm -f "${{ runner.temp }}/${NDK_ZIP}"
 
-      # =====  修复：只修改 gradle.properties 中的 SDK 版本，保留其他内容  =====
-      - name: Override SDK versions in gradle.properties (preserve other properties)
+      # ===== 关键修复：compileSdk=34 满足依赖，targetSdk=32 =====
+      - name: Override SDK versions in gradle.properties
         run: |
           cp gradle.properties gradle.properties.bak
 
-          # 使用 sed 原地替换 SDK 版本号，而非覆盖整个文件
-          # 如果属性已存在则替换值，不存在则追加
-          for prop in "compileSdkVersion=32" "targetSdkVersion=32"; do
+          # compileSdk 设 34（满足依赖库要求），targetSdk 设 32（你想要的 API 32）
+          for prop in "compileSdkVersion=34" "targetSdkVersion=32"; do
             key="${prop%%=*}"
             value="${prop#*=}"
             if grep -q "^${key}=" gradle.properties; then
@@ -79,8 +81,8 @@ jobs:
             fi
           done
 
-          echo "===== 修改后的 gradle.properties（仅 SDK 相关）====="
-          grep -E "compileSdk|targetSdk|minSdk|markwon" gradle.properties
+          echo "===== SDK 版本 ====="
+          grep -E "compileSdk|targetSdk|minSdk" gradle.properties
 
       - name: Build and attach APKs
         shell: bash {0}
@@ -121,7 +123,7 @@ jobs:
           echo "Java: $(java -version 2>&1 | head -1)"
           echo "Gradle: $(./gradlew --version 2>&1 | grep 'Gradle ' | head -1)"
           echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
-          grep -E "compileSdk|targetSdk|markwon" gradle.properties
+          grep -E "compileSdk|targetSdk" gradle.properties
           echo "Git ref: $(git rev-parse --short HEAD)"
 
           if ! ./gradlew assembleDebug; then
@@ -159,7 +161,6 @@ jobs:
               "$RELEASE_VERSION_NAME"
           else
             echo "===== 手动触发：APK 已构建 ====="
-            echo "APK 版本标记: $APK_VERSION_TAG"
             ls -lh "$APK_DIR_PATH"
           fi
 
