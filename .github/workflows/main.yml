@@ -38,7 +38,6 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # ===== 安装 API 32~35 平台 =====
       - name: Install Android SDK platforms
         run: |
           sdkmanager \
@@ -63,26 +62,20 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
           rm -f "${{ runner.temp }}/${NDK_ZIP}"
 
-      # ===== 核心修复：compileSdk=35 满足依赖，targetSdk=32 =====
       - name: Override SDK versions in gradle.properties
         run: |
           cp gradle.properties gradle.properties.bak
-
-          # compileSdk 设 35（满足 windowOptOutEdgeToEdgeEnforcement），targetSdk 设 32
           for prop in "compileSdkVersion=35" "targetSdkVersion=32"; do
             key="${prop%%=*}"
             value="${prop#*=}"
             if grep -q "^${key}=" gradle.properties; then
               sed -i "s/^${key}=.*/${key}=${value}/" gradle.properties
-              echo "✅ 更新: ${key}=${value}"
             else
               echo "${key}=${value}" >> gradle.properties
-              echo "➕ 追加: ${key}=${value}"
             fi
           done
-
           echo "===== SDK 版本 ====="
-          grep -E "compileSdk|targetSdk|minSdk" gradle.properties
+          grep -E "compileSdk|targetSdk" gradle.properties
 
       - name: Build and attach APKs
         shell: bash {0}
@@ -90,7 +83,7 @@ jobs:
           PACKAGE_VARIANT: ${{ matrix.package_variant }}
         run: |
           exit_on_error() {
-              echo "$1"
+              echo "❌ $1"
               if [ "${{ github.event_name }}" = "release" ]; then
                 RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
                 hub release delete "$RELEASE_VERSION_NAME" 2>/dev/null || true
@@ -99,6 +92,7 @@ jobs:
               exit 1
           }
 
+          # 版本名
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             INPUT_TAG="${{ github.event.inputs.tag }}"
             if [ -n "$INPUT_TAG" ]; then
@@ -112,7 +106,11 @@ jobs:
 
           echo "Building version name: $RELEASE_VERSION_NAME"
 
-          APK_DIR_PATH="./app/build/outputs/apk/debug"
+          # 🛠️ 修复：使用绝对路径 + 记录原始目录
+          ORIG_DIR="$PWD"
+          # AGP 8.x 默认输出路径（workspace 根目录相对）
+          APK_DIR_PATH="${ORIG_DIR}/app/build/outputs/apk/debug"
+
           APK_VERSION_TAG="$RELEASE_VERSION_NAME+${{ env.PACKAGE_VARIANT }}-github-debug"
           APK_BASENAME_PREFIX="termux-app_$APK_VERSION_TAG"
 
@@ -121,21 +119,30 @@ jobs:
 
           echo "===== 环境 ====="
           echo "Java: $(java -version 2>&1 | head -1)"
-          echo "Gradle: $(./gradlew --version 2>&1 | grep 'Gradle ' | head -1)"
           echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
           grep -E "compileSdk|targetSdk" gradle.properties
-          echo "Git ref: $(git rev-parse --short HEAD)"
 
           if ! ./gradlew assembleDebug; then
             exit_on_error "Build failed"
           fi
 
           echo "===== 验证 APK ====="
+          # 先检查目录是否存在
+          if [ ! -d "$APK_DIR_PATH" ]; then
+            # 尝试查找 APK 输出目录
+            FOUND_DIRS=$(find "${ORIG_DIR}/app/build" -type d -name "debug" 2>/dev/null | head -5)
+            exit_on_error "APK directory not found at '$APK_DIR_PATH'. Possible dirs: $FOUND_DIRS"
+          fi
+
+          ls -la "$APK_DIR_PATH"
+
           for abi in universal arm64-v8a armeabi-v7a x86_64 x86; do
-            if ! test -f "$APK_DIR_PATH/${APK_BASENAME_PREFIX}_$abi.apk"; then
+            APK_FILE="${APK_BASENAME_PREFIX}_${abi}.apk"
+            if [ ! -f "$APK_DIR_PATH/$APK_FILE" ]; then
               files_found="$(ls "$APK_DIR_PATH")"
-              exit_on_error "Missing APK: $abi. Found: $files_found"
+              exit_on_error "Missing APK: $APK_FILE. Files found: $files_found"
             fi
+            echo "  ✅ $APK_FILE"
           done
 
           echo "===== SHA256 ====="
@@ -147,6 +154,11 @@ jobs:
             "${APK_BASENAME_PREFIX}_x86_64.apk" \
             "${APK_BASENAME_PREFIX}_x86.apk" \
             > "${APK_BASENAME_PREFIX}_sha256sums"
+          echo "sha256sums 已生成:"
+          cat "${APK_BASENAME_PREFIX}_sha256sums"
+
+          # 回到原始工作目录（后续步骤可能依赖）
+          cd "$ORIG_DIR"
 
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "===== 附加到 Release ====="
