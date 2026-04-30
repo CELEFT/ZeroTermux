@@ -38,7 +38,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # ===== 安装多个平台以满足依赖要求 =====
+      # ===== 安装 API 32~35 平台 =====
       - name: Install Android SDK platforms
         run: |
           sdkmanager \
@@ -63,13 +63,13 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
           rm -f "${{ runner.temp }}/${NDK_ZIP}"
 
-      # ===== 关键修复：compileSdk=34 满足依赖，targetSdk=32 =====
+      # ===== 核心修复：compileSdk=35 满足依赖，targetSdk=32 =====
       - name: Override SDK versions in gradle.properties
         run: |
           cp gradle.properties gradle.properties.bak
 
-          # compileSdk 设 34（满足依赖库要求），targetSdk 设 32（你想要的 API 32）
-          for prop in "compileSdkVersion=34" "targetSdkVersion=32"; do
+          # compileSdk 设 35（满足 windowOptOutEdgeToEdgeEnforcement），targetSdk 设 32
+          for prop in "compileSdkVersion=35" "targetSdkVersion=32"; do
             key="${prop%%=*}"
             value="${prop#*=}"
             if grep -q "^${key}=" gradle.properties; then
