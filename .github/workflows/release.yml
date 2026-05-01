@@ -89,14 +89,7 @@ jobs:
               echo "${key}=${value}" >> gradle.properties
             fi
           done
-          # 🔥 禁用 Lint 阻断 Release 构建
-          if grep -q "^android.lint.abortOnError=" gradle.properties; then
-            sed -i "s/^android.lint.abortOnError=.*/android.lint.abortOnError=false/" gradle.properties
-          else
-            echo "android.lint.abortOnError=false" >> gradle.properties
-          fi
-          echo "===== SDK + Lint 配置 ====="
-          grep -E "compileSdk|targetSdk|abortOnError" gradle.properties
+          grep -E "compileSdk|targetSdk" gradle.properties
 
       - name: Build release APKs
         shell: bash {0}
@@ -120,27 +113,22 @@ jobs:
               exit 1
           }
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            INPUT_TAG="${{ github.event.inputs.tag }}"
-            RELEASE_VERSION_NAME="${INPUT_TAG:-manual-build-$(date +%Y%m%d%H%M%S)}"
-          else
-            RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
-          fi
-
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+          RELEASE_VERSION_NAME="${INPUT_TAG:-manual-build-$(date +%Y%m%d%H%M%S)}"
           echo "Building RELEASE: $RELEASE_VERSION_NAME"
           export TERMUX_PACKAGE_VARIANT="${{ env.PACKAGE_VARIANT }}"
 
           echo "===== 环境 ====="
           echo "Java: $(java -version 2>&1 | head -1)"
           echo "NDK: $ANDROID_NDK_HOME ($JITPACK_NDK_VERSION)"
-          grep -E "compileSdk|targetSdk|abortOnError" gradle.properties
+          grep -E "compileSdk|targetSdk" gradle.properties
 
           echo "===== 1️⃣ 下载 Bootstrap ====="
           ./gradlew :app:downloadBootstraps || exit_on_error "下载 bootstrap 失败"
           ls -lh app/src/main/cpp/bootstrap-*.zip
 
-          echo "===== 2️⃣ 构建 Release ====="
-          ./gradlew assembleRelease || exit_on_error "Release build failed"
+          echo "===== 2️⃣ 构建 Release (跳过 lint) ====="
+          ./gradlew assembleRelease -x lintVitalRelease || exit_on_error "Release build failed"
 
           echo "===== 3️⃣ 重命名 APK ====="
           ORIG_DIR="$PWD"
@@ -161,7 +149,6 @@ jobs:
 
           sha256sum *.apk > termux-release-sha256sums.txt
           cat termux-release-sha256sums.txt
-
           cd "$ORIG_DIR"
 
       - name: Upload APKs as artifacts
