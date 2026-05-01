@@ -80,7 +80,7 @@ jobs:
       - name: Override SDK versions in gradle.properties
         run: |
           cp gradle.properties gradle.properties.bak
-          for prop in "compileSdkVersion=35" "targetSdkVersion=32"; do
+          for prop in "compileSdkVersion=35" "targetSdkVersion=28"; do   # ← 改为 targetSdkVersion=28
             key="${prop%%=*}"
             value="${prop#*=}"
             if grep -q "^${key}=" gradle.properties; then
@@ -147,9 +147,38 @@ jobs:
           echo "===== 最终文件 ====="
           ls -lh *.apk
 
+          # 注意：sha256 计算移到签名之后，这里先不生成
+
+      # ★ 新增：显式签名 APK
+      - name: Sign APKs with apksigner
+        shell: bash
+        run: |
+          APK_DIR="app/build/outputs/apk/release"
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          echo "===== 开始签名 APK ====="
+          for apk in "$APK_DIR"/*.apk; do
+            filename=$(basename "$apk")
+            signed="${apk%.apk}-signed.apk"
+            echo "签名: $filename"
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks phone.jks \
+              --ks-pass pass:123456 \
+              --key-pass pass:654321 \
+              --ks-key-alias phone1 \
+              --out "$signed" \
+              "$apk"
+            rm -f "$apk"
+            mv "$signed" "$apk"
+            echo "验证签名: $filename"
+            "$BUILD_TOOLS/apksigner" verify --verbose "$apk"
+          done
+          echo "===== 签名完成 ====="
+
+          # 重新生成 SHA256 校验文件
+          cd "$APK_DIR"
           sha256sum *.apk > termux-release-sha256sums.txt
+          echo "===== 新 SHA256 ====="
           cat termux-release-sha256sums.txt
-          cd "$ORIG_DIR"
 
       - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
