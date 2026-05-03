@@ -1,4 +1,4 @@
-name: Build Termux APKs (compileSdk 36)
+name: Build Termux APKs (compileSdk 36, targetSdk 28)
 
 on:
   workflow_dispatch:
@@ -28,12 +28,11 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      # ===== 安装 SDK 平台（包含 API 36） =====
+      # ===== 安装 SDK 平台 =====
       - run: |
           sdkmanager \
             "platforms;android-24" \
             "platforms;android-28" \
-            "platforms;android-32" \
             "platforms;android-34" \
             "platforms;android-35" \
             "platforms;android-36" \
@@ -63,35 +62,16 @@ jobs:
             -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
 
-      # ===== 配置 SDK 版本 + extractNativeLibs =====
-      - name: Configure SDK and manifest
+      # ===== 配置 compileSdk=36, targetSdk=28 =====
+      - name: Configure SDK versions
         run: |
           cp gradle.properties gradle.properties.bak
 
-          # ===== compileSdk=36, targetSdk=32 =====
           sed -i 's/^compileSdkVersion=.*/compileSdkVersion=36/' gradle.properties
-          sed -i 's/^targetSdkVersion=.*/targetSdkVersion=32/' gradle.properties
-
-          # ===== AndroidManifest 配置 =====
-          MANIFEST="app/src/main/AndroidManifest.xml"
-
-          # 清理旧属性
-          sed -i 's/android:extractNativeLibs="[^"]*"//g' "$MANIFEST"
-          sed -i 's/android:preserveLegacyExternalStorage="[^"]*"//g' "$MANIFEST"
-
-          # 插入新属性
-          sed -i 's/<application/<application\n        android:extractNativeLibs="true"\n        android:preserveLegacyExternalStorage="true"/g' "$MANIFEST"
-
-          echo "===== AndroidManifest application 标签 ====="
-          grep -A 5 '<application' "$MANIFEST"
+          sed -i 's/^targetSdkVersion=.*/targetSdkVersion=28/' gradle.properties
 
           echo "===== SDK 配置 ====="
           grep -E 'compileSdk|targetSdk|minSdk' gradle.properties
-
-      # ===== Legacy packaging =====
-      - run: |
-          grep -q 'useLegacyPackaging' gradle.properties || \
-          echo 'android.bundle.nativeLibs.useLegacyPackaging=true' >> gradle.properties
 
       # ===== 构建 =====
       - name: Build APKs
@@ -105,15 +85,12 @@ jobs:
           export TERMUX_PACKAGE_VARIANT="$PACKAGE_VARIANT"
           cp debug.keystore phone.jks
 
-          # 下载 bootstrap
           ./gradlew :app:downloadBootstraps
-
-          # 构建
           ./gradlew assembleDebug
 
           cd app/build/outputs/apk/debug
 
-          # ===== 签名验证 =====
+          # 签名验证
           for apk in *.apk; do
             $ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner verify "$apk" || \
             $ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner sign \
@@ -124,15 +101,13 @@ jobs:
               "$apk"
           done
 
-          # ===== 重命名 =====
+          # 重命名
           for f in *.apk; do
             abi="${f##*_}"; abi="${abi%.apk}"
             mv "$f" "termux-${abi}.apk"
           done
 
           sha256sum *.apk > sha256sums.txt
-
-          echo "===== 最终文件 ====="
           ls -lh
 
       # ===== 上传 =====
@@ -146,7 +121,7 @@ jobs:
           name: sha256-${{ matrix.package_variant }}
           path: app/build/outputs/apk/debug/*sha256sums*
 
-      # ===== Release 上传 =====
+      # ===== Release =====
       - if: github.event_name == 'release'
         run: |
           APK=app/build/outputs/apk/debug
